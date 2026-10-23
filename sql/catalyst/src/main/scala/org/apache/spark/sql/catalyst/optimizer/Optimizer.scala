@@ -154,6 +154,7 @@ abstract class Optimizer(catalogManager: CatalogManager)
         EliminateSerialization,
         RemoveRedundantAliases,
         RemoveRedundantAggregates,
+        SimplifyNormalizedComparisons,
         UnwrapCastInBinaryComparison,
         RemoveNoopOperators,
         OptimizeUpdateFields,
@@ -237,6 +238,9 @@ abstract class Optimizer(catalogManager: CatalogManager)
     Batch("Aggregate", fixedPoint,
       RemoveLiteralFromGroupExpressions,
       RemoveRepetitionFromGroupExpressions),
+    // After the batches that create Aggregates for DISTINCT, dropDuplicates and set operations,
+    // and before the rules that move operators through them.
+    Batch("Normalize Floating Grouping Keys", Once, NormalizeFloatingGroupingKeys),
     // Injected rules run once here, before the operator-optimization fixed point, so they
     // can observe the plan before FoldablePropagation/ConstantFolding rewrite it.
     Batch("Pre Operator Optimization", Once,

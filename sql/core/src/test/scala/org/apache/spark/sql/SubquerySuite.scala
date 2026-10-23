@@ -3227,4 +3227,5 @@ class SubquerySuite extends SharedSparkSession
       }
     }
   }
+
 }

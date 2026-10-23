@@ -27,6 +27,7 @@ import org.apache.spark.sql.catalyst.{CatalystTypeConverters, InternalRow}
 import org.apache.spark.sql.catalyst.analysis.TypeCheckResult
 import org.apache.spark.sql.catalyst.encoders.ExamplePointUDT
 import org.apache.spark.sql.catalyst.expressions.codegen.CodegenContext
+import org.apache.spark.sql.catalyst.optimizer.NormalizeNaNAndZero
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
 import org.apache.spark.sql.catalyst.util.{ArrayData, GenericArrayData}
 import org.apache.spark.sql.catalyst.util.TypeUtils.ordinalNumber
@@ -569,6 +570,56 @@ class PredicateSuite extends SparkFunSuite with ExpressionEvalHelper {
     checkEvaluation(GreaterThan(Literal(Float.NaN), Literal(Float.PositiveInfinity)), true)
     checkEvaluation(GreaterThan(Literal(Float.NaN), Literal(Float.NaN)), false)
     checkEvaluation(GreaterThan(Literal(0.0F), Literal(-0.0F)), false)
+  }
+
+  // SimplifyNormalizedComparisons removes float/double normalization from the operands of these
+  // predicates, so each must give the same result for a value and for its normalized form: -0.0
+  // and 0.0, and NaNs with different bit patterns. The values come from the input row rather than
+  // literals, because literal codegen emits every NaN as the canonical NaN.
+  private val otherDoubleNaN = java.lang.Double.longBitsToDouble(0x7ff8000000000001L)
+  private val otherFloatNaN = java.lang.Float.intBitsToFloat(0x7fc00001)
+  private val specialDoubles = Seq(-0.0d, 0.0d, Double.NaN, otherDoubleNaN, 1.0d, null)
+  private val specialFloats = Seq(-0.0f, 0.0f, Float.NaN, otherFloatNaN, 1.0f, null)
+  private val specialValues = Seq(DoubleType -> specialDoubles, FloatType -> specialFloats)
+
+  private def normalized(dataType: DataType, v: Any): Any =
+    NormalizeNaNAndZero(Literal.create(v, dataType)).eval()
+
+  namedGridTest("SPARK-60150: binary predicates cannot observe normalization")(
+      Map[String, (Expression, Expression) => Expression](
+        "=" -> EqualTo, "<=>" -> EqualNullSafe, "<" -> LessThan, "<=" -> LessThanOrEqual,
+        ">" -> GreaterThan, ">=" -> GreaterThanOrEqual, "IN" -> ((l, r) => In(l, Seq(r))))) { op =>
+    for ((dataType, values) <- specialValues; v <- values; w <- values) {
+      val e = op(BoundReference(0, dataType, nullable = true),
+        BoundReference(1, dataType, nullable = true))
+      checkEvaluation(e, e.eval(InternalRow(normalized(dataType, v), w)), InternalRow(v, w))
+      checkEvaluation(e, e.eval(InternalRow(v, normalized(dataType, w))), InternalRow(v, w))
+    }
+    // A FLOAT value compared with a DOUBLE or DECIMAL value is widened to DOUBLE first.
+    for (v <- specialFloats; w <- specialDoubles) {
+      val e = op(Cast(BoundReference(0, FloatType, nullable = true), DoubleType),
+        BoundReference(1, DoubleType, nullable = true))
+      checkEvaluation(e, e.eval(InternalRow(normalized(FloatType, v), w)), InternalRow(v, w))
+    }
+  }
+
+  namedGridTest("SPARK-60150: null and NaN checks cannot observe normalization")(
+      Map[String, Expression => Expression](
+        "IS NULL" -> IsNull, "IS NOT NULL" -> IsNotNull, "isnan" -> IsNaN)) { op =>
+    for ((dataType, values) <- specialValues; v <- values) {
+      val e = op(BoundReference(0, dataType, nullable = true))
+      checkEvaluation(e, e.eval(InternalRow(normalized(dataType, v))), InternalRow(v))
+    }
+  }
+
+  test("SPARK-60150: InSet cannot observe normalization") {
+    // With the HashSet that OptimizeIn builds from an IN list of literals. A null in the list is
+    // left out: interpreted and generated code differ on NaN INSET (null), for raw and normalized
+    // NaNs alike.
+    for ((dataType, values) <- specialValues; v <- values; w <- values if w != null) {
+      val e = InSet(BoundReference(0, dataType, nullable = true), HashSet[Any](w))
+      checkEvaluation(e, e.eval(InternalRow(normalized(dataType, v))), InternalRow(v))
+    }
   }
 
   test("SPARK-32110: compare special double/float values in array") {

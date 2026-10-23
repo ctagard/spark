@@ -110,6 +110,20 @@ class PythonUDFSuite extends SharedSparkSession {
     }
   }
 
+  test("SPARK-60444: grouped-agg pandas UDF aggregates normalize float/double keys") {
+    assume(shouldTestPandasUDFs)
+    val pandasTestUDF = TestGroupedAggPandasUDF(name = "pandas_udf")
+    val df = Seq((-0.0d, 1.0d), (0.0d, 2.0d)).toDF("x", "v")
+    // -0.0 and 0.0 are one group with the key 0.0, as for any other aggregate, also as read by a
+    // filter above the aggregate and when column pruning removes another aggregate function.
+    val grouped = df.groupBy("x").agg(pandasTestUDF(col("v")).as("p"))
+    checkAnswer(grouped.select(col("x").cast("string"), col("p")), Row("0.0", 2))
+    assert(grouped.where(col("x").cast("string") === "-0.0").collect().isEmpty)
+    val mixed = df.groupBy("x").agg(pandasTestUDF(col("v")).as("p"), count("*").as("c"))
+      .where(col("x").cast("string") === "0.0").select(col("x").cast("string"), col("p"))
+    checkAnswer(mixed, Row("0.0", 2))
+  }
+
   test("PythonUDAF pretty name") {
     assume(shouldTestPandasUDFs)
     val udfName = "pandas_udf"
