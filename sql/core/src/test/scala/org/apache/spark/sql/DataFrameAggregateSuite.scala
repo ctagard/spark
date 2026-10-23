@@ -1282,16 +1282,9 @@ class DataFrameAggregateSuite extends SharedSparkSession
     checkAnswer(df.dropDuplicates().where(isNegZero), Nil)
     checkAnswer(df.intersectAll(df).where(isNegZero), Nil)
     checkAnswer(df.except(Seq(1.0d).toDF("x")).where(isNegZero), Nil)
-    checkAnswer(Seq(-0.0f, -0.0f).toDF("x").distinct().where(isNegZero), Nil)
-    checkAnswer(
-      df.select(struct(col("x")).as("s")).distinct().where(col("s.x").cast("string") === "-0.0"),
-      Nil)
 
     withTempView("t") {
       df.createOrReplaceTempView("t")
-      checkAnswer(
-        sql("SELECT * FROM (SELECT DISTINCT x FROM t) WHERE cast(x AS STRING) = '-0.0'"),
-        Nil)
       // An alias computed from the key is also evaluated on the normalized value.
       checkAnswer(
         sql("SELECT * FROM (SELECT cast(x AS STRING) AS s FROM t GROUP BY x) WHERE s = '-0.0'"),
@@ -1307,41 +1300,8 @@ class DataFrameAggregateSuite extends SharedSparkSession
     checkAnswer(zeros.groupBy("x").count().where(col("x") === 0.0d), Row(0.0d, 2))
   }
 
-  test("SPARK-60150: IN and NOT IN subqueries on a float/double grouping key") {
-    withTempView("t", "u") {
-      // Two rows, so that OptimizeOneRowPlan does not remove the aggregate. Nullable columns, so
-      // that NOT IN is planned as a null-aware anti join.
-      Seq(Some(0.0d), Some(0.0d)).toDF("x").createOrReplaceTempView("t")
-      Seq(Some(-0.0d)).toDF("y").createOrReplaceTempView("u")
-
-      // A float/double key is pushed unnormalized, and the join normalizes both sides.
-      checkAnswer(
-        sql("SELECT * FROM (SELECT DISTINCT x FROM t) WHERE x IN (SELECT y FROM u)"),
-        Row(0.0d))
-      checkAnswer(
-        sql("SELECT * FROM (SELECT DISTINCT x FROM t) WHERE x NOT IN (SELECT y FROM u)"),
-        Nil)
-      // A struct key is pushed normalized, so the subquery side of the join must be normalized too,
-      // so that 0.0 matches -0.0. The structs are nullable, like the columns above.
-      def struct(c: String): String = s"IF($c IS NULL, NULL, named_struct('a', $c))"
-      val structs = s"SELECT * FROM (SELECT DISTINCT ${struct("x")} AS s FROM t)"
-      val structY = s"(SELECT ${struct("y")} FROM u)"
-      checkAnswer(sql(s"$structs WHERE s IN $structY"), Row(Row(0.0d)))
-      checkAnswer(sql(s"$structs WHERE s NOT IN $structY"), Nil)
-    }
-  }
-
-  test("SPARK-60150: filter above a group only aggregate over at most one row or under LIMIT 1") {
-    withTempView("t") {
-      Seq(-0.0d).toDF("x").createOrReplaceTempView("t")
-      // The child has at most one row (OptimizeOneRowPlan). The aggregate outputs 0.0.
-      val oneRow =
-        "SELECT cast(x AS STRING) FROM (SELECT DISTINCT x FROM (SELECT x FROM t LIMIT 1))"
-      checkAnswer(sql(s"$oneRow WHERE cast(x AS STRING) = '0.0'"), Row("0.0"))
-      checkAnswer(sql(s"$oneRow WHERE cast(x AS STRING) = '-0.0'"), Nil)
-    }
-
-    // LIMIT 1 above the aggregate (LimitPushDown).
+  test("SPARK-60150: filter above a group only aggregate under LIMIT 1") {
+    // LimitPushDown replaces the aggregate with a Project.
     val distinct = Seq(-0.0d, -0.0d).toDF("x").distinct()
     val isZero = col("x").cast("string") === "0.0"
     checkAnswer(distinct.where(isZero).limit(1).select(col("x").cast("string")), Row("0.0"))
@@ -1350,21 +1310,7 @@ class DataFrameAggregateSuite extends SharedSparkSession
     assert(first == 0.0d && 1.0d / first > 0, s"$first is not 0.0")
   }
 
-  test("SPARK-60150: filter pushed below a DISTINCT that an upper aggregate makes redundant") {
-    withTempView("t") {
-      Seq(-0.0d, -0.0d).toDF("x").createOrReplaceTempView("t")
-      // The DISTINCT outputs 0.0, which the filter keeps and the upper aggregate groups as '0.0'.
-      checkAnswer(
-        sql("SELECT cast(x AS STRING) AS k FROM (SELECT DISTINCT x FROM t) " +
-          "WHERE cast(x AS STRING) = '0.0' GROUP BY 1"),
-        Row("0.0"))
-      // Without a filter too (SPARK-60093): the upper aggregate reads the DISTINCT's 0.0.
-      checkAnswer(
-        sql("SELECT cast(x AS STRING) AS k, max(x) AS m FROM " +
-          "(SELECT DISTINCT x FROM VALUES (-0.0D), (0.0D) t(x)) GROUP BY 1"),
-        Row("0.0", 0.0d))
-    }
-
+  test("SPARK-60150: DISTINCT below an aggregate on the same float key is still removed") {
     withTempView("u") {
       Seq((-0.0d, 1), (0.0d, 2)).toDF("d", "a").createOrReplaceTempView("u")
       // The upper aggregate groups by the key directly and normalizes it itself, so the DISTINCT
@@ -1410,6 +1356,64 @@ class DataFrameAggregateSuite extends SharedSparkSession
         case scan: FileSourceScanExec => scan.metadata("PushedFilters")
       }
       assert(pushedFilters.exists(_.contains("GreaterThan(f,1.5)")), pushedFilters)
+    }
+  }
+
+  // A key holding a float/double value as -0.0, and its twin holding 0.0. Maps cannot be compared,
+  // so IN and NOT IN do not apply to them.
+  private case class FloatKey(negative: String, positive: String, comparable: Boolean = true)
+
+  private val floatKeyShapes: Map[String, FloatKey] = Map(
+    "DOUBLE" -> FloatKey("-0.0D", "0.0D"),
+    "FLOAT" -> FloatKey("CAST(-0.0D AS FLOAT)", "CAST(0.0D AS FLOAT)"),
+    "STRUCT" -> FloatKey("named_struct('d', -0.0D)", "named_struct('d', 0.0D)"),
+    "nested STRUCT" -> FloatKey(
+      "named_struct('s', named_struct('d', -0.0D))", "named_struct('s', named_struct('d', 0.0D))"),
+    "ARRAY" -> FloatKey("array(1.0D, -0.0D)", "array(1.0D, 0.0D)"),
+    "ARRAY of STRUCT" ->
+      FloatKey("array(named_struct('d', -0.0D))", "array(named_struct('d', 0.0D))"),
+    "STRUCT of ARRAY" ->
+      FloatKey("named_struct('a', array(-0.0D))", "named_struct('a', array(0.0D))"),
+    "MAP" -> FloatKey("map('m', -0.0D)", "map('m', 0.0D)", comparable = false))
+
+  // The twins are one group, output with the normalized key, which every query must read.
+  namedGridTest("SPARK-60150: queries read normalized float/double keys of any shape")(
+      floatKeyShapes) { case FloatKey(negative, positive, comparable) =>
+    withTempView("t", "neg", "nullable", "pos") {
+      sql(s"SELECT * FROM VALUES ($negative), ($positive) AS t(k)").createOrReplaceTempView("t")
+      sql(s"SELECT * FROM VALUES ($negative) AS neg(k)").createOrReplaceTempView("neg")
+      sql(s"SELECT * FROM VALUES ($negative), (NULL) AS nullable(k)")
+        .createOrReplaceTempView("nullable")
+      sql(s"SELECT * FROM VALUES ($positive) AS pos(k)").createOrReplaceTempView("pos")
+      assert(!spark.table("neg").schema.head.nullable)
+      // True only for a key that still holds -0.0, i.e. was not normalized.
+      def signed(c: String): String = s"cast($c AS STRING) LIKE '%-0.0%'"
+      def strings(q: String): Seq[String] = sql(q).collect().map(_.getString(0)).toSeq
+
+      // A filter above the aggregate (SPARK-60150).
+      checkAnswer(sql(s"SELECT * FROM (SELECT k FROM t GROUP BY k) WHERE ${signed("k")}"), Nil)
+      // Both keys are one group.
+      checkAnswer(sql(s"SELECT count(*), ${signed("k")} FROM t GROUP BY k"), Row(2, false))
+      // A lower aggregate under an upper one that reads its key through a cast (SPARK-60093).
+      val computed = strings("SELECT s FROM (SELECT cast(k AS STRING) AS s FROM " +
+        "(SELECT k FROM t GROUP BY k)) GROUP BY s")
+      assert(computed.size == 1 && !computed.head.contains("-0.0"), computed)
+      // An aggregate over one row, which OptimizeOneRowPlan replaces.
+      val oneRow = strings(
+        "SELECT cast(k AS STRING) FROM (SELECT k FROM (SELECT k FROM neg LIMIT 1) GROUP BY k)")
+      assert(oneRow.size == 1 && !oneRow.head.contains("-0.0"), oneRow)
+      // IN and NOT IN between the twins, as semi and anti joins: on a non-nullable key, whose
+      // NOT IN condition NullPropagation simplifies (SPARK-60473), and on a nullable key (a
+      // null-aware anti join); directly and with the key read through an aggregate below.
+      if (comparable) {
+        for (keys <- Seq("neg", "nullable");
+            from <- Seq(keys, s"(SELECT k FROM $keys GROUP BY k)")) {
+          checkAnswer(sql(s"SELECT count(*) FROM $from WHERE k IN (SELECT k FROM pos)"), Row(1))
+          checkAnswer(sql(s"SELECT count(*) FROM $from WHERE k NOT IN (SELECT k FROM pos)"), Row(0))
+          checkAnswer(
+            sql(s"SELECT count(*) FROM $from WHERE (k, k) NOT IN (SELECT k, k FROM pos)"), Row(0))
+        }
+      }
     }
   }
 

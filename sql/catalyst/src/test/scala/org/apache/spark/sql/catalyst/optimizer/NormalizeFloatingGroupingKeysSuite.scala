@@ -19,11 +19,11 @@ package org.apache.spark.sql.catalyst.optimizer
 
 import org.apache.spark.sql.catalyst.dsl.expressions._
 import org.apache.spark.sql.catalyst.dsl.plans._
-import org.apache.spark.sql.catalyst.expressions.{Alias, Cast, Expression, InSet, InSubquery, IsNaN, ListQuery}
+import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, AttributeReference, Cast, Expression, InSet, InSubquery, IsNaN, ListQuery}
 import org.apache.spark.sql.catalyst.plans.PlanTest
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules.RuleExecutor
-import org.apache.spark.sql.types.{DoubleType, StringType, StructField, StructType}
+import org.apache.spark.sql.types.{ArrayType, DataType, DoubleType, FloatType, IntegerType, MapType, StringType, StructField, StructType}
 
 class NormalizeFloatingGroupingKeysSuite extends PlanTest {
 
@@ -76,17 +76,7 @@ class NormalizeFloatingGroupingKeysSuite extends PlanTest {
         .analyze)
   }
 
-  test("normalize struct keys and leave other keys, streaming plans and repeated runs as is") {
-    val s = $"s".struct(StructType(Seq(StructField("d", DoubleType))))
-    val structs = LocalRelation(s)
-    val key = normalizedKey(s)
-    comparePlans(
-      Normalize.execute(structs.groupBy(s)(s).analyze),
-      structs.select(s, key).groupBy(key.toAttribute)(key.toAttribute.withName("s")).analyze)
-
-    val ints = relation.groupBy(i)(i, max(x).as("m")).analyze
-    comparePlans(Normalize.execute(ints), ints)
-
+  test("leave streaming plans and repeated runs as they are") {
     val streaming = LocalRelation(Seq(x), isStreaming = true).groupBy(x)(x).analyze
     comparePlans(Normalize.execute(streaming), streaming)
 
@@ -155,5 +145,42 @@ class NormalizeFloatingGroupingKeysSuite extends PlanTest {
         .select(key.toAttribute.withName("x"))
         .limit(1)
         .analyze)
+  }
+
+  private val doubleStruct = StructType(Seq(StructField("d", DoubleType)))
+
+  namedGridTest("normalize grouping keys of every type holding float/double values")(
+      Map[String, DataType](
+    "DOUBLE" -> DoubleType,
+    "FLOAT" -> FloatType,
+    "STRUCT" -> doubleStruct,
+    "nested STRUCT" -> StructType(Seq(StructField("s", doubleStruct))),
+    "ARRAY" -> ArrayType(DoubleType),
+    "ARRAY of STRUCT" -> ArrayType(doubleStruct),
+    "STRUCT of ARRAY" -> StructType(Seq(StructField("a", ArrayType(FloatType)))),
+    "MAP" -> MapType(StringType, DoubleType))) { dataType =>
+    val k = AttributeReference("k", dataType)()
+    val keys = LocalRelation(k, i)
+    val optimized = Normalize.execute(keys.groupBy(k)(k, count(i).as("c")).analyze)
+    // The aggregate groups by the normalized key from the Project below it, outputs it as k, and
+    // counts the raw input.
+    optimized match {
+      case Aggregate(Seq(group: Attribute), Seq(out: Attribute, _), Project(list, _), _) =>
+        val normalized = list.collectFirst { case a: Alias if a.exprId == group.exprId => a.child }
+        assert(normalized.exists(_.semanticEquals(NormalizeFloatingNumbers.normalize(k))))
+        assert(out.exprId == group.exprId && out.name == "k" && out.dataType == dataType)
+      case other => fail(s"unexpected plan:\n$other")
+    }
+  }
+
+  namedGridTest("leave grouping keys without float/double values as they are")(
+      Map[String, DataType](
+        "INT" -> IntegerType,
+        "STRING" -> StringType,
+        "STRUCT of INT" -> StructType(Seq(StructField("n", IntegerType))),
+        "ARRAY of STRING" -> ArrayType(StringType))) { dataType =>
+    val k = AttributeReference("k", dataType)()
+    val query = LocalRelation(k, i).groupBy(k)(k, count(i).as("c")).analyze
+    comparePlans(Normalize.execute(query), query)
   }
 }
