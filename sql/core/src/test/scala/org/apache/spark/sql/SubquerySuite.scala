@@ -3227,4 +3227,15 @@ class SubquerySuite extends SharedSparkSession
       }
     }
   }
+
+  test("SPARK-60473: NOT IN on non-nullable float/double columns compares -0.0 and 0.0 as equal") {
+    withTempView("t", "u") {
+      // Non-nullable, so that NullPropagation folds the null-aware anti join's isnull branch.
+      Seq(0.0d).toDF("x").createOrReplaceTempView("t")
+      Seq((-0.0d, -0.0d)).toDF("y", "z").createOrReplaceTempView("u")
+      checkAnswer(sql("SELECT * FROM t WHERE x NOT IN (SELECT y FROM u)"), Nil)
+      checkAnswer(sql("SELECT * FROM t WHERE x IN (SELECT y FROM u)"), Row(0.0d))
+      checkAnswer(sql("SELECT * FROM t WHERE (x, x) NOT IN (SELECT y, z FROM u)"), Nil)
+    }
+  }
 }

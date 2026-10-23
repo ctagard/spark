@@ -19,7 +19,7 @@ package org.apache.spark.sql.catalyst.optimizer
 
 import org.apache.spark.sql.catalyst.dsl.expressions._
 import org.apache.spark.sql.catalyst.dsl.plans._
-import org.apache.spark.sql.catalyst.expressions.{ArrayDistinct, ArrayExcept, ArrayIntersect, ArraysOverlap, ArrayUnion, CaseWhen, If, IsNull, KnownFloatingPointNormalized}
+import org.apache.spark.sql.catalyst.expressions.{ArrayDistinct, ArrayExcept, ArrayIntersect, ArraysOverlap, ArrayUnion, CaseWhen, If, IsNull, KnownFloatingPointNormalized, Literal}
 import org.apache.spark.sql.catalyst.plans.{LeftAnti, PlanTest}
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules.RuleExecutor
@@ -102,12 +102,30 @@ class NormalizeFloatingPointNumbersSuite extends PlanTest {
 
     val optimized = Optimize.execute(query)
     val doubleOptimized = Optimize.execute(optimized)
-    val joinCond = IsNull(a) === IsNull(b) &&
-      KnownFloatingPointNormalized(NormalizeNaNAndZero(coalesce(a, 0.0))) ===
-        KnownFloatingPointNormalized(NormalizeNaNAndZero(coalesce(b, 0.0)))
+    val joinCond = KnownFloatingPointNormalized(NormalizeNaNAndZero(a)) <=>
+      KnownFloatingPointNormalized(NormalizeNaNAndZero(b))
     val correctAnswer = testRelation1.join(testRelation2, condition = Some(joinCond))
 
     comparePlans(doubleOptimized, correctAnswer)
+  }
+
+  test("normalize floating points in join key equalities of any condition shape") {
+    val normA = KnownFloatingPointNormalized(NormalizeNaNAndZero(a))
+    val normB = KnownFloatingPointNormalized(NormalizeNaNAndZero(b))
+    // A null-aware anti join whose isnull branch NullPropagation folded to false, an equality
+    // under a disjunction, and one already normalized on one side.
+    for ((condition, expected) <- Seq(
+        ((a === b) || Literal(false), (normA === normB) || Literal(false)),
+        (((a === b) && (a > 1.0)) || (b === a),
+          ((normA === normB) && (a > 1.0)) || (normB === normA)),
+        (normA === b, normA === normB))) {
+      comparePlans(
+        Optimize.execute(testRelation1.join(testRelation2, condition = Some(condition))),
+        testRelation1.join(testRelation2, condition = Some(expected)))
+    }
+    // An equality within one side is not a join key.
+    val oneSide = testRelation1.join(testRelation2, condition = Some(a === Literal(1.0)))
+    comparePlans(Optimize.execute(oneSide), oneSide)
   }
 
   test("SPARK-32258: normalize the children of If") {

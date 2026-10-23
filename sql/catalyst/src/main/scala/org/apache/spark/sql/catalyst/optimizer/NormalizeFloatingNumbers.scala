@@ -18,10 +18,9 @@
 package org.apache.spark.sql.catalyst.optimizer
 
 import org.apache.spark.SparkException
-import org.apache.spark.sql.catalyst.expressions.{Alias, And, ArrayTransform, CaseWhen, Coalesce, CreateArray, CreateMap, CreateNamedStruct, EqualTo, ExpectsInputTypes, Expression, GetStructField, If, IsNull, KnownFloatingPointNormalized, LambdaFunction, Literal, NamedLambdaVariable, Or, TransformValues, UnaryExpression}
+import org.apache.spark.sql.catalyst.expressions.{Alias, ArrayTransform, CaseWhen, Coalesce, CreateArray, CreateMap, CreateNamedStruct, EqualNullSafe, EqualTo, ExpectsInputTypes, Expression, GetStructField, If, IsNull, KnownFloatingPointNormalized, LambdaFunction, Literal, NamedLambdaVariable, PredicateHelper, TransformValues, UnaryExpression}
 import org.apache.spark.sql.catalyst.expressions.codegen.{CodegenContext, ExprCode}
-import org.apache.spark.sql.catalyst.planning.{ExtractEquiJoinKeys, ExtractSingleColumnNullAwareAntiJoin}
-import org.apache.spark.sql.catalyst.plans.logical.{LogicalPlan, Window}
+import org.apache.spark.sql.catalyst.plans.logical.{Join, LogicalPlan, Window}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.trees.TreePattern._
 import org.apache.spark.sql.types._
@@ -51,8 +50,10 @@ import org.apache.spark.util.ArrayImplicits._
  *
  * Case 1 is handled in [[org.apache.spark.sql.catalyst.util.SQLOrderingUtil]] and in the
  *  `genEqual` method of [[org.apache.spark.sql.catalyst.expressions.codegen.CodegenContext]].
- * Case 2 is handled during planning in the `Aggregation` and `StatefulAggregationStrategy` objects
- *  of [[org.apache.spark.sql.execution.SparkStrategies]].
+ * Case 2 is handled by [[NormalizeFloatingGroupingKeys]], which makes it explicit in the plan for
+ *  the optimizer, and during planning in the `Aggregation` and `StatefulAggregationStrategy`
+ *  objects of [[org.apache.spark.sql.execution.SparkStrategies]], which also covers Aggregates
+ *  created later in optimization and streaming Aggregates.
  * Cases 3 and 4 are handled by this optimizer rule. Array set operations handle case 5 in their
  * expression evaluation.
  *
@@ -64,7 +65,7 @@ import org.apache.spark.util.ArrayImplicits._
  * Note that, this rule must be executed at the end of optimizer, because the optimizer may create
  * new joins(the subquery rewrite) and new join conditions(the join reorder).
  */
-object NormalizeFloatingNumbers extends Rule[LogicalPlan] {
+object NormalizeFloatingNumbers extends Rule[LogicalPlan] with PredicateHelper {
 
   def apply(plan: LogicalPlan): LogicalPlan =
     plan.transformWithPruning(_.containsAnyPattern(WINDOW, JOIN)) {
@@ -74,36 +75,31 @@ object NormalizeFloatingNumbers extends Rule[LogicalPlan] {
         // the input row as it is.
         w.copy(partitionSpec = w.partitionSpec.map(normalize))
 
-      // Only hash join and sort merge join need the normalization. Here we catch all Joins with
-      // join keys, assuming Joins with join keys are always planned as hash join or sort merge
-      // join. It's very unlikely that we will break this assumption in the near future.
-      case j @ ExtractEquiJoinKeys(_, leftKeys, rightKeys, condition, _, _, _, _)
-          // The analyzer guarantees left and right joins keys are of the same data type. Here we
-          // only need to check join keys of one side.
-          if leftKeys.exists(k => needNormalize(k)) =>
-        val newLeftJoinKeys = leftKeys.map(normalize)
-        val newRightJoinKeys = rightKeys.map(normalize)
-        val newConditions = newLeftJoinKeys.zip(newRightJoinKeys).map {
-          case (l, r) => EqualTo(l, r)
-        } ++ condition
-        j.copy(condition = Some(newConditions.reduce(And)))
-
-      // The specialized NAAJ is a hash join, but its OR condition is not an equi-join shape.
-      case j @ ExtractSingleColumnNullAwareAntiJoin(leftKeys, rightKeys)
-          if leftKeys.exists(needNormalize) =>
-        val equality = EqualTo(normalize(leftKeys.head), normalize(rightKeys.head))
-        j.copy(condition = Some(Or(equality, IsNull(equality))))
-
-      // TODO: ideally Aggregate should also be handled here, but its grouping expressions are
-      // mixed in its aggregate expressions. It's unreliable to change the grouping expressions
-      // here. For now we normalize grouping expressions during planning. See Case 2 in the
-      // Scaladoc just above.
+      // Hash joins and sort merge joins compare their keys as bytes, so the operands of every
+      // equality between the two sides of a join are normalized, wherever the equality is in the
+      // join condition. Matching equalities rather than the shapes the planner extracts join keys
+      // from means no shape of the condition is missed, e.g. the `(a = b) OR isnull(a = b)` of a
+      // null-aware anti join, or `(a = b) OR false` before it is simplified.
+      case j @ Join(left, right, _, Some(condition), _) =>
+        val normalized = condition.transform {
+          case e @ (_: EqualTo | _: EqualNullSafe)
+              if comparesBothSides(e, left, right) && e.children.exists(needNormalize) =>
+            e.mapChildren(normalize)
+        }
+        if (normalized fastEquals condition) j else j.copy(condition = Some(normalized))
     }
+
+  private def comparesBothSides(e: Expression, left: LogicalPlan, right: LogicalPlan): Boolean = {
+    val Seq(l, r) = e.children
+    l.references.nonEmpty && r.references.nonEmpty && (
+      canEvaluate(l, left) && canEvaluate(r, right) ||
+        canEvaluate(l, right) && canEvaluate(r, left))
+  }
 
   /**
    * Short circuit if the underlying expression is already normalized
    */
-  private def needNormalize(expr: Expression): Boolean = expr match {
+  private[sql] def needNormalize(expr: Expression): Boolean = expr match {
     case KnownFloatingPointNormalized(_) => false
     case _ => needNormalize(expr.dataType)
   }
